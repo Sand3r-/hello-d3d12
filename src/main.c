@@ -5,13 +5,13 @@
 #include <glfw/glfw3.h>
 
 #define COBJMACROS
-	#pragma warning(push)
-	#pragma warning(disable:4115) // named type definition in parentheses
-	#include <d3d12.h>
-	#include <d3dcompiler.h>
-	#include <dxgi1_6.h>
+    #pragma warning(push)
+    #pragma warning(disable:4115) // named type definition in parentheses
+    #include <d3d12.h>
+    #include <d3dcompiler.h>
+    #include <dxgi1_6.h>
     #include <d3d12sdklayers.h>
-	#pragma warning(pop)
+    #pragma warning(pop)
 #undef COBJMACROS
 
 #define HD_EXIT_FAILURE -1
@@ -133,7 +133,6 @@ int main()
 
     while (!glfwWindowShouldClose(window))
     {
-
         glfwPollEvents();
     }
 
