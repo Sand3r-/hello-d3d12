@@ -360,7 +360,7 @@ void Render(IDXGISwapChain4* swapChain, ID3D12CommandQueue* g_CommandQueue,
 
         ExitOnFailure(ID3D12GraphicsCommandList_Close(g_CommandList));
 
-        ID3D12CommandList* const commandLists[] = { g_CommandList };
+        ID3D12CommandList* const commandLists[] = { (ID3D12CommandList* const)g_CommandList };
         ID3D12CommandQueue_ExecuteCommandLists(g_CommandQueue, _countof(commandLists), commandLists);
 
         g_FrameFenceValues[g_CurrentBackBufferIndex] = Signal(g_CommandQueue, g_Fence, &g_FenceValue);
