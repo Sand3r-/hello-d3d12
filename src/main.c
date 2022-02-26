@@ -1,8 +1,12 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
+#include <assert.h>
+#include <time.h>
 #include <signal.h>
+#define GLFW_EXPOSE_NATIVE_WIN32
 #include <glfw/glfw3.h>
+#include <glfw/glfw3native.h>
 
 #define COBJMACROS
     #pragma warning(push)
@@ -17,7 +21,20 @@
 #define HD_EXIT_FAILURE -1
 #define HD_EXIT_SUCCESS 0
 
+// Number of render targets
+#define FRAMES_NUM 3
+
 #define ExitOnFailure(expression) if (FAILED(expression)) raise(SIGINT);
+
+ID3D12Resource* g_BackBuffers[FRAMES_NUM];
+ID3D12CommandAllocator* g_CommandAllocators[FRAMES_NUM];
+uint64_t g_FrameFenceValues[FRAMES_NUM];
+uint64_t g_FenceValue = 0;
+UINT g_CurrentBackBufferIndex;
+UINT g_RTVDescriptorSize;
+ID3D12DescriptorHeap* g_RTVDescriptorHeap;
+ID3D12Fence* g_Fence;
+HANDLE g_FenceEvent;
 
 IDXGIAdapter4* GetAdapter()
 {
@@ -39,12 +56,13 @@ IDXGIAdapter4* GetAdapter()
         IDXGIAdapter1_GetDesc1(dxgiAdapter1, &dxgiAdapterDesc1);
 
         if ((dxgiAdapterDesc1.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0 &&
-            SUCCEEDED(D3D12CreateDevice(dxgiAdapter1,
+            SUCCEEDED(D3D12CreateDevice((IUnknown*)dxgiAdapter1,
                                         D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, NULL)) &&
             dxgiAdapterDesc1.DedicatedVideoMemory > maxDedicatedVideoMemory )
         {
             maxDedicatedVideoMemory = dxgiAdapterDesc1.DedicatedVideoMemory;
-            dxgiAdapter4 = (IDXGIAdapter4*)dxgiAdapter1;
+
+            ExitOnFailure(IDXGIAdapter1_QueryInterface(dxgiAdapter1, &IID_IDXGIAdapter4, &dxgiAdapter4));
         }
     }
 
@@ -56,7 +74,7 @@ IDXGIAdapter4* GetAdapter()
 ID3D12Device2* CreateDevice(IDXGIAdapter4* adapter)
 {
     ID3D12Device2* d3d12Device2;
-    ExitOnFailure(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, &d3d12Device2));
+    ExitOnFailure(D3D12CreateDevice((IUnknown*)adapter, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, &d3d12Device2));
 
     // Enable debug messages in debug mode.
 #if defined(_DEBUG)
@@ -109,6 +127,261 @@ ID3D12CommandQueue* CreateCommandQueue(ID3D12Device2* device, D3D12_COMMAND_LIST
     return d3d12CommandQueue;
 }
 
+IDXGISwapChain4* CreateSwapChain(HWND hWnd,
+                                 ID3D12CommandQueue* commandQueue,
+                                 uint32_t width, uint32_t height, uint32_t bufferCount )
+{
+    IDXGISwapChain4* dxgiSwapChain4;
+    IDXGIFactory4* dxgiFactory4;
+    UINT createFactoryFlags = 0;
+#if defined(_DEBUG)
+    createFactoryFlags = DXGI_CREATE_FACTORY_DEBUG;
+#endif
+
+    ExitOnFailure(CreateDXGIFactory2(createFactoryFlags, &IID_IDXGIFactory4, &dxgiFactory4));
+
+    DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {
+            .Width = width,
+            .Height = height,
+            .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+            .Stereo = FALSE,
+            .SampleDesc = {
+                .Count = 1,
+                .Quality = 0,
+            },
+            .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            .BufferCount = bufferCount,
+            .Scaling = DXGI_SCALING_STRETCH,
+            .SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            .AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED,
+            .Flags = 0
+        };
+
+
+    IDXGISwapChain1* swapChain1;
+    ExitOnFailure(IDXGIFactory4_CreateSwapChainForHwnd(dxgiFactory4,
+                                                       (IUnknown*)commandQueue,
+                                                       hWnd,
+                                                       &swapChainDesc,
+                                                       NULL,
+                                                       NULL,
+                                                       &swapChain1));
+
+    // Disable the Alt+Enter fullscreen toggle feature. Switching to fullscreen
+    // will be handled manually.
+    ExitOnFailure(IDXGIFactory4_MakeWindowAssociation(dxgiFactory4, hWnd, DXGI_MWA_NO_ALT_ENTER));
+
+    ExitOnFailure(IDXGISwapChain1_QueryInterface(swapChain1, &IID_IDXGISwapChain1, &dxgiSwapChain4));
+
+    return dxgiSwapChain4;
+}
+
+ID3D12DescriptorHeap* CreateDescriptorHeap(ID3D12Device2* device,
+                                           D3D12_DESCRIPTOR_HEAP_TYPE type,
+                                           uint32_t numDescriptors)
+{
+    ID3D12DescriptorHeap* descriptorHeap;
+
+    D3D12_DESCRIPTOR_HEAP_DESC desc = {0};
+    desc.NumDescriptors = numDescriptors;
+    desc.Type = type;
+
+    ExitOnFailure(ID3D12Device2_CreateDescriptorHeap(device, &desc, &IID_ID3D12DescriptorHeap, &descriptorHeap));
+
+    return descriptorHeap;
+}
+
+void UpdateRenderTargetViews(ID3D12Device2* device,
+                             IDXGISwapChain4* swapChain, ID3D12DescriptorHeap* descriptorHeap)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(descriptorHeap, &rtvHandle);
+
+    for (int i = 0; i < FRAMES_NUM; ++i)
+    {
+        ID3D12Resource* backBuffer;
+        ExitOnFailure(IDXGISwapChain4_GetBuffer(swapChain, i, &IID_ID3D12Resource, &backBuffer));
+
+        ID3D12Device2_CreateRenderTargetView(device, backBuffer, NULL, rtvHandle);
+
+        g_BackBuffers[i] = backBuffer;
+
+        rtvHandle.ptr += g_RTVDescriptorSize;
+    }
+}
+
+ID3D12CommandAllocator* CreateCommandAllocator(ID3D12Device2* device,
+                                               D3D12_COMMAND_LIST_TYPE type)
+{
+    ID3D12CommandAllocator* commandAllocator;
+    ExitOnFailure(ID3D12Device2_CreateCommandAllocator(device, type,
+                                                       &IID_ID3D12CommandAllocator,
+                                                       &commandAllocator));
+
+    return commandAllocator;
+}
+
+ID3D12GraphicsCommandList* CreateCommandList(ID3D12Device2* device,
+                                             ID3D12CommandAllocator* commandAllocator,
+                                             D3D12_COMMAND_LIST_TYPE type)
+{
+    ID3D12GraphicsCommandList* commandList;
+    ExitOnFailure(ID3D12Device2_CreateCommandList(device, 0, type, commandAllocator, NULL, &IID_ID3D12CommandList, &commandList));
+
+    ExitOnFailure(ID3D12GraphicsCommandList_Close(commandList));
+
+    return commandList;
+}
+
+ID3D12Fence* CreateFence(ID3D12Device2* device)
+{
+    // Reset fence values
+    memset(g_FrameFenceValues, 0, FRAMES_NUM * sizeof(uint64_t));
+
+    ID3D12Fence* fence;
+    ExitOnFailure(ID3D12Device2_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, &fence));
+
+    return fence;
+}
+
+D3D12_RESOURCE_BARRIER D3D12_RESOURCE_BARRIER_Transition(
+        ID3D12Resource* pResource,
+        D3D12_RESOURCE_STATES stateBefore,
+        D3D12_RESOURCE_STATES stateAfter,
+        UINT subresource, // = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_BARRIER_FLAGS flags) // = D3D12_RESOURCE_BARRIER_FLAG_NONE
+{
+    D3D12_RESOURCE_BARRIER barrier;
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Flags = flags;
+    barrier.Transition.pResource = pResource;
+    barrier.Transition.StateBefore = stateBefore;
+    barrier.Transition.StateAfter = stateAfter;
+    barrier.Transition.Subresource = subresource;
+    return barrier;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE D3D12_CPU_DESCRIPTOR_HANDLE_Offset(
+    D3D12_CPU_DESCRIPTOR_HANDLE handle,
+    INT offsetInDescriptors,
+    UINT descriptorIncrementSize)
+{
+    handle.ptr += offsetInDescriptors * descriptorIncrementSize;
+    return handle;
+}
+
+uint64_t Signal(ID3D12CommandQueue* commandQueue, ID3D12Fence* fence,
+                uint64_t* fenceValue)
+{
+    (*fenceValue)++;
+    ExitOnFailure(ID3D12CommandQueue_Signal(commandQueue, fence, *fenceValue));
+
+    return *fenceValue;
+}
+
+HANDLE CreateEventHandle()
+{
+    HANDLE fenceEvent;
+
+    fenceEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    assert(fenceEvent && "Failed to create fence event.");
+
+    return fenceEvent;
+}
+
+void WaitForFenceValue(ID3D12Fence* fence, uint64_t fenceValue, HANDLE fenceEvent, DWORD duration)
+{
+    if (ID3D12Fence_GetCompletedValue(fence) < fenceValue)
+    {
+        ExitOnFailure(ID3D12Fence_SetEventOnCompletion(fence, fenceValue, fenceEvent));
+        WaitForSingleObject(fenceEvent, duration ? duration : INFINITE);
+    }
+}
+
+void Update()
+{
+    static uint64_t frameCounter = 0;
+    static double elapsedSeconds = 0.0;
+    static clock_t t0;
+
+    frameCounter++;
+    clock_t t1 = clock();
+    clock_t deltaTime = t1 - t0;
+    t0 = t1;
+
+    elapsedSeconds += (double)deltaTime / CLOCKS_PER_SEC;
+    if (elapsedSeconds > 1.0)
+    {
+        char buffer[500];
+        double fps = frameCounter / elapsedSeconds;
+        sprintf_s(buffer, 500, "FPS: %f\n", fps);
+        OutputDebugString(buffer);
+
+        frameCounter = 0;
+        elapsedSeconds = 0.0;
+    }
+}
+
+void Render(IDXGISwapChain4* swapChain, ID3D12CommandQueue* g_CommandQueue,
+            ID3D12GraphicsCommandList* g_CommandList)
+{
+    ID3D12CommandAllocator* commandAllocator = g_CommandAllocators[g_CurrentBackBufferIndex];
+    ID3D12Resource* backBuffer = g_BackBuffers[g_CurrentBackBufferIndex];
+
+    ID3D12CommandAllocator_Reset(commandAllocator);
+    ID3D12GraphicsCommandList_Reset(g_CommandList, commandAllocator, NULL);
+
+    // Clear the render target.
+    {
+        D3D12_RESOURCE_BARRIER barrier = D3D12_RESOURCE_BARRIER_Transition(backBuffer,
+                                                    D3D12_RESOURCE_STATE_PRESENT,
+                                                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                                    D3D12_RESOURCE_BARRIER_FLAG_NONE);
+        ID3D12GraphicsCommandList_ResourceBarrier(g_CommandList, 1, &barrier);
+
+        FLOAT clearColor[] = { 0.635f, 0.415f, 0.905f, 1.0f };
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(g_RTVDescriptorHeap, &rtv);
+
+        rtv = D3D12_CPU_DESCRIPTOR_HANDLE_Offset(rtv, g_CurrentBackBufferIndex, g_RTVDescriptorSize);
+
+        ID3D12GraphicsCommandList_ClearRenderTargetView(g_CommandList, rtv, clearColor, 0, NULL);
+    }
+
+    // Present
+    {
+        D3D12_RESOURCE_BARRIER barrier = D3D12_RESOURCE_BARRIER_Transition(backBuffer,
+                                                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                    D3D12_RESOURCE_STATE_PRESENT,
+                                                    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                                    D3D12_RESOURCE_BARRIER_FLAG_NONE);
+        ID3D12GraphicsCommandList_ResourceBarrier(g_CommandList, 1, &barrier);
+
+        ExitOnFailure(ID3D12GraphicsCommandList_Close(g_CommandList));
+
+        ID3D12CommandList* const commandLists[] = { g_CommandList };
+        ID3D12CommandQueue_ExecuteCommandLists(g_CommandQueue, _countof(commandLists), commandLists);
+
+        g_FrameFenceValues[g_CurrentBackBufferIndex] = Signal(g_CommandQueue, g_Fence, &g_FenceValue);
+
+        UINT syncInterval = 1;
+        UINT presentFlags = 0;
+        ExitOnFailure(IDXGISwapChain4_Present(swapChain, syncInterval, presentFlags));
+
+        g_CurrentBackBufferIndex = IDXGISwapChain4_GetCurrentBackBufferIndex(swapChain);
+
+        WaitForFenceValue(g_Fence, g_FrameFenceValues[g_CurrentBackBufferIndex], g_FenceEvent, 0);
+    }
+}
+
+void Flush(ID3D12CommandQueue* commandQueue, ID3D12Fence* fence,
+    uint64_t* fenceValue, HANDLE fenceEvent)
+{
+    uint64_t fenceValueForSignal = Signal(commandQueue, fence, fenceValue);
+    WaitForFenceValue(fence, fenceValueForSignal, fenceEvent, 0);
+}
+
 int main()
 {
     GLFWwindow* window;
@@ -130,18 +403,52 @@ int main()
     IDXGIAdapter4* dxgiAdapter4 = GetAdapter();
     ID3D12Device2* device = CreateDevice(dxgiAdapter4);
     ID3D12CommandQueue* g_CommandQueue = CreateCommandQueue(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    IDXGISwapChain4* swapChain = CreateSwapChain(hWnd, g_CommandQueue,
+                                                 width, height, FRAMES_NUM);
+
+    g_CurrentBackBufferIndex = IDXGISwapChain4_GetCurrentBackBufferIndex(swapChain);
+
+    g_RTVDescriptorHeap = CreateDescriptorHeap(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, FRAMES_NUM);
+    g_RTVDescriptorSize = ID3D12Device2_GetDescriptorHandleIncrementSize(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    UpdateRenderTargetViews(device, swapChain, g_RTVDescriptorHeap);
+
+    for (int i = 0; i < FRAMES_NUM; ++i)
+    {
+        g_CommandAllocators[i] = CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    }
+    ID3D12GraphicsCommandList* g_CommandList = CreateCommandList(device,
+        g_CommandAllocators[g_CurrentBackBufferIndex], D3D12_COMMAND_LIST_TYPE_DIRECT);
+
+    g_Fence = CreateFence(device);
+    g_FenceEvent = CreateEventHandle();
 
     while (!glfwWindowShouldClose(window))
     {
+        Update();
+        Render(swapChain, g_CommandQueue, g_CommandList);
         glfwPollEvents();
     }
 
     glfwDestroyWindow(window);
     glfwTerminate();
 
-    IDXGIAdapter4_Release(dxgiAdapter4);
-    ID3D12Device2_Release(device);
+    // Make sure the command queue has finished all commands before closing.
+    Flush(g_CommandQueue, g_Fence, &g_FenceValue, g_FenceEvent);
+
+    CloseHandle(g_FenceEvent);
+
+    ID3D12Fence_Release(g_Fence);
+    ID3D12GraphicsCommandList_Release(g_CommandList);
+    for (int i = 0; i < FRAMES_NUM; ++i)
+    {
+        ID3D12CommandAllocator_Release(g_CommandAllocators[i]);
+    }
+    ID3D12DescriptorHeap_Release(g_RTVDescriptorHeap);
+    IDXGISwapChain4_Release(swapChain);
     ID3D12CommandQueue_Release(g_CommandQueue);
+    ID3D12Device2_Release(device);
+    IDXGIAdapter4_Release(dxgiAdapter4);
 
     return 0;
 }
