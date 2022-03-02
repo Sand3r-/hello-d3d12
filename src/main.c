@@ -7,6 +7,7 @@
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <glfw/glfw3.h>
 #include <glfw/glfw3native.h>
+#include <cglm/cglm.h>
 
 #define COBJMACROS
     #pragma warning(push)
@@ -26,15 +27,51 @@
 
 #define ExitOnFailure(expression) if (FAILED(expression)) raise(SIGINT);
 
+typedef struct Vertex
+{
+    vec3 Position;
+    vec3 Color;
+} Vertex;
+
+static Vertex g_Vertices[8] = {
+    { {-1.0f, -1.0f, -1.0f}, {0.0f, 0.0f, 0.0f} }, // 0
+    { {-1.0f,  1.0f, -1.0f}, {0.0f, 1.0f, 0.0f} }, // 1
+    { {1.0f,  1.0f, -1.0f}, {1.0f, 1.0f, 0.0f} }, // 2
+    { {1.0f, -1.0f, -1.0f}, {1.0f, 0.0f, 0.0f} }, // 3
+    { {-1.0f, -1.0f,  1.0f}, {0.0f, 0.0f, 1.0f} }, // 4
+    { {-1.0f,  1.0f,  1.0f}, {0.0f, 1.0f, 1.0f} }, // 5
+    { {1.0f,  1.0f,  1.0f}, {1.0f, 1.0f, 1.0f} }, // 6
+    { {1.0f, -1.0f,  1.0f}, {1.0f, 0.0f, 1.0f} }  // 7
+};
+
+static WORD g_Indicies[36] =
+{
+    0, 1, 2, 0, 2, 3,
+    4, 6, 5, 4, 7, 6,
+    4, 5, 1, 4, 1, 0,
+    3, 2, 6, 3, 6, 7,
+    1, 5, 6, 1, 6, 2,
+    4, 0, 3, 4, 3, 7
+};
+
 ID3D12Resource* g_BackBuffers[FRAMES_NUM];
 ID3D12CommandAllocator* g_CommandAllocators[FRAMES_NUM];
 uint64_t g_FrameFenceValues[FRAMES_NUM];
 uint64_t g_FenceValue = 0;
 UINT g_CurrentBackBufferIndex;
 UINT g_RTVDescriptorSize;
+UINT g_DSVDescriptorSize;
 ID3D12DescriptorHeap* g_RTVDescriptorHeap;
+ID3D12DescriptorHeap* g_DSVDescriptorHeap;
 ID3D12Fence* g_Fence;
 HANDLE g_FenceEvent;
+
+void EnableDebuggingLayer()
+{
+    ID3D12Debug* debugInterface;
+    ExitOnFailure(D3D12GetDebugInterface(&IID_ID3D12Debug, &debugInterface));
+    ID3D12Debug_EnableDebugLayer(debugInterface);
+}
 
 IDXGIAdapter4* GetAdapter()
 {
@@ -74,7 +111,7 @@ IDXGIAdapter4* GetAdapter()
 ID3D12Device2* CreateDevice(IDXGIAdapter4* adapter)
 {
     ID3D12Device2* d3d12Device2;
-    ExitOnFailure(D3D12CreateDevice((IUnknown*)adapter, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, &d3d12Device2));
+    ExitOnFailure(D3D12CreateDevice((IUnknown*)adapter, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device2, &d3d12Device2));
 
     // Enable debug messages in debug mode.
 #if defined(_DEBUG)
@@ -244,6 +281,205 @@ ID3D12Fence* CreateFence(ID3D12Device2* device)
     return fence;
 }
 
+// Row-by-row memcpy
+// Taken form d3dx12.h, rewritten for C
+inline void MemcpySubresource(
+    const D3D12_MEMCPY_DEST* pDest,
+    const D3D12_SUBRESOURCE_DATA* pSrc,
+    SIZE_T RowSizeInBytes,
+    UINT NumRows,
+    UINT NumSlices)
+{
+    for (UINT z = 0; z < NumSlices; ++z)
+    {
+        BYTE* pDestSlice = (BYTE*)(pDest->pData) + pDest->SlicePitch * z;
+        const BYTE* pSrcSlice = (const BYTE*)(pSrc->pData) + pSrc->SlicePitch * z;
+        for (UINT y = 0; y < NumRows; ++y)
+        {
+            memcpy(pDestSlice + pDest->RowPitch * y,
+                   pSrcSlice + pSrc->RowPitch * y,
+                   RowSizeInBytes);
+        }
+    }
+}
+
+// Taken form d3dx12.h, rewritten for C
+inline UINT64 UpdateSubresourcesImpl(
+    ID3D12GraphicsCommandList* pCmdList,
+    ID3D12Resource* pDestinationResource,
+    ID3D12Resource* pIntermediate,
+    UINT FirstSubresource,
+    UINT NumSubresources,
+    UINT64 RequiredSize,
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT* pLayouts,
+    const UINT* pNumRows,
+    const UINT64* pRowSizesInBytes,
+    const D3D12_SUBRESOURCE_DATA* pSrcData)
+{
+    // Minor validation
+    D3D12_RESOURCE_DESC IntermediateDesc;
+    ID3D12Resource_GetDesc(pIntermediate, &IntermediateDesc);
+    D3D12_RESOURCE_DESC DestinationDesc;
+    ID3D12Resource_GetDesc(pDestinationResource, &DestinationDesc);
+    if (IntermediateDesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        IntermediateDesc.Width < RequiredSize + pLayouts[0].Offset ||
+        RequiredSize > (SIZE_T)-1 ||
+        (DestinationDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            (FirstSubresource != 0 || NumSubresources != 1)))
+    {
+        return 0;
+    }
+
+    BYTE* pData;
+    HRESULT hr = ID3D12Resource_Map(pIntermediate, 0, NULL, &pData);
+    if (FAILED(hr))
+    {
+        return 0;
+    }
+
+    for (UINT i = 0; i < NumSubresources; ++i)
+    {
+        if (pRowSizesInBytes[i] > (SIZE_T)-1) return 0;
+        D3D12_MEMCPY_DEST DestData = { pData + pLayouts[i].Offset, pLayouts[i].Footprint.RowPitch, pLayouts[i].Footprint.RowPitch * pNumRows[i] };
+        MemcpySubresource(&DestData, &pSrcData[i], (SIZE_T)pRowSizesInBytes[i], pNumRows[i], pLayouts[i].Footprint.Depth);
+    }
+    ID3D12Resource_Unmap(pIntermediate, 0, NULL);
+
+    if (DestinationDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    {
+        ID3D12GraphicsCommandList_CopyBufferRegion(pCmdList, pDestinationResource, 0, pIntermediate, pLayouts[0].Offset, pLayouts[0].Footprint.Width);
+    }
+    else
+    {
+        D3D12_TEXTURE_COPY_LOCATION Dst = {
+            .pResource = pDestinationResource,
+            .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        };
+
+        D3D12_TEXTURE_COPY_LOCATION Src = {
+            .pResource = pIntermediate,
+            .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        };
+        for (UINT i = 0; i < NumSubresources; ++i)
+        {
+            Dst.SubresourceIndex = FirstSubresource + i;
+            Src.PlacedFootprint = pLayouts[i];
+
+            ID3D12GraphicsCommandList_CopyTextureRegion(pCmdList, &Dst, 0, 0, 0, &Src, NULL);
+        }
+    }
+    return RequiredSize;
+}
+
+// Heap-allocating UpdateSubresources implementation
+// Taken form d3dx12.h, rewritten for C
+inline UINT64 UpdateSubresources(
+    ID3D12GraphicsCommandList* pCmdList,
+    ID3D12Resource* pDestinationResource,
+    ID3D12Resource* pIntermediate,
+    UINT64 IntermediateOffset,
+    UINT FirstSubresource,
+    UINT NumSubresources,
+    D3D12_SUBRESOURCE_DATA* pSrcData)
+{
+    UINT64 RequiredSize = 0;
+    UINT64 MemToAlloc = (UINT64)(sizeof(D3D12_PLACED_SUBRESOURCE_FOOTPRINT) + sizeof(UINT) + sizeof(UINT64)) * NumSubresources;
+    if (MemToAlloc > SIZE_MAX)
+    {
+       return 0;
+    }
+    void* pMem = HeapAlloc(GetProcessHeap(), 0, (SIZE_T)MemToAlloc);
+    if (pMem == NULL)
+    {
+       return 0;
+    }
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT* pLayouts = (D3D12_PLACED_SUBRESOURCE_FOOTPRINT*)pMem;
+    UINT64* pRowSizesInBytes = (UINT64*)(pLayouts + NumSubresources);
+    UINT* pNumRows = (UINT*)(pRowSizesInBytes + NumSubresources);
+
+    D3D12_RESOURCE_DESC Desc;
+    ID3D12Resource_GetDesc(pDestinationResource, &Desc);
+    ID3D12Device* pDevice;
+    ID3D12Resource_GetDevice(pDestinationResource, &IID_ID3D12Device, &pDevice);
+    ID3D12Device_GetCopyableFootprints(pDevice, &Desc, FirstSubresource,
+        NumSubresources, IntermediateOffset, pLayouts, pNumRows,
+        pRowSizesInBytes, &RequiredSize);
+    ID3D12Device_Release(pDevice);
+
+    UINT64 Result = UpdateSubresourcesImpl(pCmdList, pDestinationResource, pIntermediate, FirstSubresource, NumSubresources, RequiredSize, pLayouts, pNumRows, pRowSizesInBytes, pSrcData);
+    HeapFree(GetProcessHeap(), 0, pMem);
+    return Result;
+}
+
+void InitialiseBuffer(
+    ID3D12Device2* device,
+    ID3D12GraphicsCommandList* commandList,
+    ID3D12Resource** pDestinationResource,
+    ID3D12Resource** pIntermediateResource,
+    size_t numElements, size_t elementSize, const void* bufferData,
+    D3D12_RESOURCE_FLAGS flags)
+{
+    if (bufferData == NULL)
+    {
+        fprintf(stderr, "Buffer data is empty");
+        return;
+    }
+
+    size_t bufferSize = numElements * elementSize;
+
+    D3D12_HEAP_PROPERTIES dstHeapProperties = {
+        .Type = D3D12_HEAP_TYPE_DEFAULT,
+        .CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+        .MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN,
+        .CreationNodeMask = 1,
+        .VisibleNodeMask = 1
+    };
+
+    D3D12_RESOURCE_DESC resourceDesc = {
+        .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+        .Alignment = 0,
+        .Width = bufferSize,
+        .Height = 1,
+        .DepthOrArraySize = 1,
+        .MipLevels = 1,
+        .Format = DXGI_FORMAT_UNKNOWN,
+        .SampleDesc = {
+            .Count = 1,
+            .Quality = 0
+        },
+        .Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        .Flags = flags,
+    };
+
+    // Create committed resource with an optimized GPU access that will serve
+    // as the destination buffer for the data
+    ExitOnFailure(ID3D12Device2_CreateCommittedResource(device, &dstHeapProperties,
+        D3D12_HEAP_FLAG_NONE, &resourceDesc, D3D12_RESOURCE_STATE_COPY_DEST,
+        NULL, &IID_ID3D12Resource, (void**)pDestinationResource));
+
+    // Copy the heap properites from destination heap, but change the heap type
+    D3D12_HEAP_PROPERTIES intermediateHeapProperties = dstHeapProperties;
+    intermediateHeapProperties.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    // Copy the resource desc from the destination resource, but clear flags
+    D3D12_RESOURCE_DESC intermediateResourceDesc = resourceDesc;
+    intermediateResourceDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    // Create an intermediate buffer for transfering buffer data from CPU to GPU
+    ExitOnFailure(ID3D12Device2_CreateCommittedResource(device, &intermediateHeapProperties,
+        D3D12_HEAP_FLAG_NONE, &intermediateResourceDesc, D3D12_RESOURCE_STATE_GENERIC_READ,
+        NULL, &IID_ID3D12Resource, (void**)pIntermediateResource));
+
+    D3D12_SUBRESOURCE_DATA subresourceData = {
+        .pData = bufferData,
+        .RowPitch = bufferSize,
+        .SlicePitch = subresourceData.RowPitch
+    };
+
+    UpdateSubresources(commandList, *pDestinationResource,
+        *pIntermediateResource, 0, 0, 1, &subresourceData);
+}
+
 D3D12_RESOURCE_BARRIER D3D12_RESOURCE_BARRIER_Transition(
         ID3D12Resource* pResource,
         D3D12_RESOURCE_STATES stateBefore,
@@ -296,6 +532,29 @@ void WaitForFenceValue(ID3D12Fence* fence, uint64_t fenceValue, HANDLE fenceEven
         ExitOnFailure(ID3D12Fence_SetEventOnCompletion(fence, fenceValue, fenceEvent));
         WaitForSingleObject(fenceEvent, duration ? duration : INFINITE);
     }
+}
+
+void LoadVertexBuffer(ID3D12Device2* device,
+    ID3D12CommandQueue* commandQueue,
+    ID3D12CommandAllocator* bufferInitCommandAllocator,
+    ID3D12GraphicsCommandList* commandList,
+    ID3D12Resource** vertexBuffer,
+    ID3D12Resource** intermediateVertexBuffer)
+{
+    ID3D12GraphicsCommandList_Reset(commandList, bufferInitCommandAllocator, NULL);
+    InitialiseBuffer(device, commandList,
+        vertexBuffer, intermediateVertexBuffer,
+        _countof(g_Vertices), sizeof(Vertex), g_Vertices,
+        D3D12_RESOURCE_FLAG_NONE);
+
+    ExitOnFailure(ID3D12GraphicsCommandList_Close(commandList));
+
+    ID3D12CommandList* const commandLists[] = { (ID3D12CommandList* const)commandList };
+    ID3D12CommandQueue_ExecuteCommandLists(commandQueue, _countof(commandLists), commandLists);
+
+    uint64_t fenceVal = 0;
+    uint64_t fenceValue = Signal(commandQueue, g_Fence, &fenceVal);
+    WaitForFenceValue(g_Fence, fenceValue, g_FenceEvent, 0);
 }
 
 void Update()
@@ -384,6 +643,10 @@ void Flush(ID3D12CommandQueue* commandQueue, ID3D12Fence* fence,
 
 int main()
 {
+#ifdef _DEBUG
+    EnableDebuggingLayer();
+#endif
+
     GLFWwindow* window;
     if (!glfwInit())
         exit(HD_EXIT_FAILURE);
@@ -417,11 +680,44 @@ int main()
     {
         g_CommandAllocators[i] = CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
     }
+
+    ID3D12CommandAllocator* bufferInitCommandAllocator = CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+
     ID3D12GraphicsCommandList* g_CommandList = CreateCommandList(device,
-        g_CommandAllocators[g_CurrentBackBufferIndex], D3D12_COMMAND_LIST_TYPE_DIRECT);
+        bufferInitCommandAllocator, D3D12_COMMAND_LIST_TYPE_DIRECT);
 
     g_Fence = CreateFence(device);
     g_FenceEvent = CreateEventHandle();
+
+    // Vertex buffer for the cube.
+    ID3D12Resource* vertexBuffer = NULL;
+    ID3D12Resource* intermediateVertexBuffer = NULL;
+
+    // Initialise the vertex buffer
+    LoadVertexBuffer(device, g_CommandQueue, bufferInitCommandAllocator,
+        g_CommandList, &vertexBuffer, &intermediateVertexBuffer);
+
+    D3D12_VERTEX_BUFFER_VIEW vertexBufferView;
+    // Index buffer for the cube.
+    ID3D12Resource* indexBuffer;
+    D3D12_INDEX_BUFFER_VIEW indexBufferView;
+    // Depth buffer.
+    ID3D12Resource* depthBuffer;
+
+    // Root signature
+    ID3D12RootSignature* m_RootSignature;
+
+    // Pipeline state object.
+    ID3D12PipelineState* m_PipelineState;
+
+    D3D12_VIEWPORT m_Viewport = { 0.0f, 0.0f, (float)width, (float)height, D3D12_MIN_DEPTH, D3D12_MAX_DEPTH };
+    D3D12_RECT m_ScissorRect = { 0, 0, LONG_MAX, LONG_MAX };
+
+    float m_FoV = 45.0;
+
+    mat4 m_ModelMatrix;
+    mat4 m_ViewMatrix;
+    mat4 m_ProjectionMatrix;
 
     while (!glfwWindowShouldClose(window))
     {
@@ -438,12 +734,16 @@ int main()
 
     CloseHandle(g_FenceEvent);
 
+    // TODO: release resources, desc heap and root sig, and pipeline state
+    ID3D12Resource_Release(vertexBuffer);
+    ID3D12Resource_Release(intermediateVertexBuffer);
     ID3D12Fence_Release(g_Fence);
     ID3D12GraphicsCommandList_Release(g_CommandList);
     for (int i = 0; i < FRAMES_NUM; ++i)
     {
         ID3D12CommandAllocator_Release(g_CommandAllocators[i]);
     }
+    ID3D12CommandAllocator_Release(bufferInitCommandAllocator);
     ID3D12DescriptorHeap_Release(g_RTVDescriptorHeap);
     IDXGISwapChain4_Release(swapChain);
     ID3D12CommandQueue_Release(g_CommandQueue);

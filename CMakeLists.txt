@@ -17,6 +17,9 @@ set(GLFW_BUILD_EXAMPLES OFF CACHE INTERNAL "")
 set(GLFW_BUILD_TESTS OFF CACHE INTERNAL "")
 set(GLFW_BUILD_DOCS OFF CACHE INTERNAL "")
 
+set(CGLM_USE_TEST OFF CACHE INTERNAL "")
+
 add_subdirectory(external/glfw)
+add_subdirectory(external/cglm)
 add_subdirectory(src)
 set_directory_properties(PROPERTIES VS_STARTUP_PROJECT ${TARGET})
