@@ -15,6 +15,7 @@
     #include <d3d12.h>
     #include <d3dcompiler.h>
     #include <dxgi1_6.h>
+    #include <dxgidebug.h>
     #include <d3d12sdklayers.h>
     #pragma warning(pop)
 #undef COBJMACROS
@@ -26,6 +27,12 @@
 #define FRAMES_NUM 3
 
 #define ExitOnFailure(expression) if (FAILED(expression)) raise(SIGINT);
+#define S(x) #x
+#define S_(x) S(x)
+#define S__LINE__ S_(__LINE__)
+#define GEN_REPORT_STRING() "Reporting Live objects at " __FUNCTION__ ", L:" S__LINE__ "\n"
+#define REPORT_LIVE_OBJ() ReportLiveObjects(GEN_REPORT_STRING())
+
 
 typedef struct Vertex
 {
@@ -54,6 +61,7 @@ static WORD g_Indicies[36] =
     4, 0, 3, 4, 3, 7
 };
 
+IDXGIDebug1* g_Debug;
 ID3D12Resource* g_BackBuffers[FRAMES_NUM];
 ID3D12CommandAllocator* g_CommandAllocators[FRAMES_NUM];
 uint64_t g_FrameFenceValues[FRAMES_NUM];
@@ -71,6 +79,17 @@ void EnableDebuggingLayer()
     ID3D12Debug* debugInterface;
     ExitOnFailure(D3D12GetDebugInterface(&IID_ID3D12Debug, &debugInterface));
     ID3D12Debug_EnableDebugLayer(debugInterface);
+    ID3D12Debug_Release(debugInterface);
+
+    ExitOnFailure(DXGIGetDebugInterface1(0, &IID_IDXGIDebug1, &g_Debug));
+}
+
+void ReportLiveObjects(const char* report_title)
+{
+    OutputDebugString("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
+    OutputDebugString(report_title);
+    OutputDebugString("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
+    IDXGIDebug1_ReportLiveObjects(g_Debug, DXGI_DEBUG_ALL, DXGI_DEBUG_RLO_ALL);
 }
 
 IDXGIAdapter4* GetAdapter()
@@ -101,6 +120,7 @@ IDXGIAdapter4* GetAdapter()
 
             ExitOnFailure(IDXGIAdapter1_QueryInterface(dxgiAdapter1, &IID_IDXGIAdapter4, &dxgiAdapter4));
         }
+        IDXGIAdapter1_Release(dxgiAdapter1);
     }
 
     IDXGIFactory4_Release(dxgiFactory);
@@ -121,7 +141,7 @@ ID3D12Device2* CreateDevice(IDXGIAdapter4* adapter)
     {
         ID3D12InfoQueue_SetBreakOnSeverity(pInfoQueue, D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
         ID3D12InfoQueue_SetBreakOnSeverity(pInfoQueue, D3D12_MESSAGE_SEVERITY_ERROR, TRUE);
-        ID3D12InfoQueue_SetBreakOnSeverity(pInfoQueue, D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
+        ID3D12InfoQueue_SetBreakOnSeverity(pInfoQueue, D3D12_MESSAGE_SEVERITY_WARNING, FALSE);
 
         // Suppress messages based on their severity level
         D3D12_MESSAGE_SEVERITY Severities[] =
@@ -146,6 +166,7 @@ ID3D12Device2* CreateDevice(IDXGIAdapter4* adapter)
     }
 #endif
 
+    ID3D12Object_SetName(d3d12Device2, L"Device2");
     return d3d12Device2;
 }
 
@@ -161,6 +182,7 @@ ID3D12CommandQueue* CreateCommandQueue(ID3D12Device2* device, D3D12_COMMAND_LIST
 
     ExitOnFailure(ID3D12Device2_CreateCommandQueue(device, &desc, &IID_ID3D12CommandQueue, &d3d12CommandQueue));
 
+    ID3D12Object_SetName(d3d12CommandQueue, L"CommandQueue");
     return d3d12CommandQueue;
 }
 
@@ -208,7 +230,7 @@ IDXGISwapChain4* CreateSwapChain(HWND hWnd,
     // will be handled manually.
     ExitOnFailure(IDXGIFactory4_MakeWindowAssociation(dxgiFactory4, hWnd, DXGI_MWA_NO_ALT_ENTER));
 
-    ExitOnFailure(IDXGISwapChain1_QueryInterface(swapChain1, &IID_IDXGISwapChain1, &dxgiSwapChain4));
+    ExitOnFailure(IDXGISwapChain1_QueryInterface(swapChain1, &IID_IDXGISwapChain4, &dxgiSwapChain4));
 
     return dxgiSwapChain4;
 }
@@ -225,6 +247,7 @@ ID3D12DescriptorHeap* CreateDescriptorHeap(ID3D12Device2* device,
 
     ExitOnFailure(ID3D12Device2_CreateDescriptorHeap(device, &desc, &IID_ID3D12DescriptorHeap, &descriptorHeap));
 
+    ID3D12Object_SetName(descriptorHeap, L"DescriptorHeap");
     return descriptorHeap;
 }
 
@@ -254,7 +277,7 @@ ID3D12CommandAllocator* CreateCommandAllocator(ID3D12Device2* device,
     ExitOnFailure(ID3D12Device2_CreateCommandAllocator(device, type,
                                                        &IID_ID3D12CommandAllocator,
                                                        &commandAllocator));
-
+    ID3D12Object_SetName(commandAllocator, L"Command Allocator");
     return commandAllocator;
 }
 
@@ -267,6 +290,7 @@ ID3D12GraphicsCommandList* CreateCommandList(ID3D12Device2* device,
 
     ExitOnFailure(ID3D12GraphicsCommandList_Close(commandList));
 
+    ID3D12Object_SetName(commandList, L"CommandList");
     return commandList;
 }
 
@@ -278,6 +302,7 @@ ID3D12Fence* CreateFence(ID3D12Device2* device)
     ID3D12Fence* fence;
     ExitOnFailure(ID3D12Device2_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, &fence));
 
+    ID3D12Object_SetName(fence, L"Fence");
     return fence;
 }
 
@@ -473,7 +498,7 @@ void InitialiseBuffer(
     D3D12_SUBRESOURCE_DATA subresourceData = {
         .pData = bufferData,
         .RowPitch = bufferSize,
-        .SlicePitch = subresourceData.RowPitch
+        .SlicePitch = bufferSize
     };
 
     UpdateSubresources(commandList, *pDestinationResource,
@@ -534,17 +559,19 @@ void WaitForFenceValue(ID3D12Fence* fence, uint64_t fenceValue, HANDLE fenceEven
     }
 }
 
-void LoadVertexBuffer(ID3D12Device2* device,
+void LoadBuffer(ID3D12Device2* device,
     ID3D12CommandQueue* commandQueue,
-    ID3D12CommandAllocator* bufferInitCommandAllocator,
+    ID3D12CommandAllocator* commandAllocator,
     ID3D12GraphicsCommandList* commandList,
     ID3D12Resource** vertexBuffer,
-    ID3D12Resource** intermediateVertexBuffer)
+    ID3D12Resource** intermediateVertexBuffer,
+    size_t numElements, size_t elementSize, void* data)
 {
-    ID3D12GraphicsCommandList_Reset(commandList, bufferInitCommandAllocator, NULL);
+    ID3D12CommandAllocator_Reset(commandAllocator);
+    ID3D12GraphicsCommandList_Reset(commandList, commandAllocator, NULL);
     InitialiseBuffer(device, commandList,
         vertexBuffer, intermediateVertexBuffer,
-        _countof(g_Vertices), sizeof(Vertex), g_Vertices,
+        numElements, elementSize, data,
         D3D12_RESOURCE_FLAG_NONE);
 
     ExitOnFailure(ID3D12GraphicsCommandList_Close(commandList));
@@ -552,8 +579,7 @@ void LoadVertexBuffer(ID3D12Device2* device,
     ID3D12CommandList* const commandLists[] = { (ID3D12CommandList* const)commandList };
     ID3D12CommandQueue_ExecuteCommandLists(commandQueue, _countof(commandLists), commandLists);
 
-    uint64_t fenceVal = 0;
-    uint64_t fenceValue = Signal(commandQueue, g_Fence, &fenceVal);
+    uint64_t fenceValue = Signal(commandQueue, g_Fence, &g_FenceValue);
     WaitForFenceValue(g_Fence, fenceValue, g_FenceEvent, 0);
 }
 
@@ -681,10 +707,8 @@ int main()
         g_CommandAllocators[i] = CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
     }
 
-    ID3D12CommandAllocator* bufferInitCommandAllocator = CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
-
     ID3D12GraphicsCommandList* g_CommandList = CreateCommandList(device,
-        bufferInitCommandAllocator, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        g_CommandAllocators[g_CurrentBackBufferIndex], D3D12_COMMAND_LIST_TYPE_DIRECT);
 
     g_Fence = CreateFence(device);
     g_FenceEvent = CreateEventHandle();
@@ -694,12 +718,29 @@ int main()
     ID3D12Resource* intermediateVertexBuffer = NULL;
 
     // Initialise the vertex buffer
-    LoadVertexBuffer(device, g_CommandQueue, bufferInitCommandAllocator,
-        g_CommandList, &vertexBuffer, &intermediateVertexBuffer);
+    LoadBuffer(device, g_CommandQueue, g_CommandAllocators[g_CurrentBackBufferIndex],
+        g_CommandList, &vertexBuffer, &intermediateVertexBuffer,
+        _countof(g_Vertices), sizeof(Vertex), g_Vertices);
+
+    ID3D12Object_SetName(vertexBuffer, L"VertexBuffer");
+    ID3D12Object_SetName(intermediateVertexBuffer, L"IntermediateVertexBuffer");
 
     D3D12_VERTEX_BUFFER_VIEW vertexBufferView;
+
+    vertexBufferView.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(vertexBuffer);
+    vertexBufferView.SizeInBytes = sizeof(g_Vertices);
+    vertexBufferView.StrideInBytes = sizeof(Vertex);
+
     // Index buffer for the cube.
     ID3D12Resource* indexBuffer;
+    ID3D12Resource* intermediateIndexBuffer;
+    LoadBuffer(device, g_CommandQueue, g_CommandAllocators[g_CurrentBackBufferIndex],
+        g_CommandList, &indexBuffer, &intermediateIndexBuffer,
+        _countof(g_Indicies), sizeof(WORD), g_Indicies);
+
+    ID3D12Object_SetName(indexBuffer, L"indexBuffer");
+    ID3D12Object_SetName(intermediateIndexBuffer, L"intermediateIndexBuffer");
+
     D3D12_INDEX_BUFFER_VIEW indexBufferView;
     // Depth buffer.
     ID3D12Resource* depthBuffer;
@@ -735,6 +776,8 @@ int main()
     CloseHandle(g_FenceEvent);
 
     // TODO: release resources, desc heap and root sig, and pipeline state
+    ID3D12Resource_Release(indexBuffer);
+    ID3D12Resource_Release(intermediateIndexBuffer);
     ID3D12Resource_Release(vertexBuffer);
     ID3D12Resource_Release(intermediateVertexBuffer);
     ID3D12Fence_Release(g_Fence);
@@ -743,12 +786,19 @@ int main()
     {
         ID3D12CommandAllocator_Release(g_CommandAllocators[i]);
     }
-    ID3D12CommandAllocator_Release(bufferInitCommandAllocator);
     ID3D12DescriptorHeap_Release(g_RTVDescriptorHeap);
+    // Please don't ask
+    IDXGISwapChain4_Release(swapChain);
+    IDXGISwapChain4_Release(swapChain);
     IDXGISwapChain4_Release(swapChain);
     ID3D12CommandQueue_Release(g_CommandQueue);
     ID3D12Device2_Release(device);
+    ID3D12Device2_Release(device);
     IDXGIAdapter4_Release(dxgiAdapter4);
+
+#ifdef _DEBUG
+    REPORT_LIVE_OBJ();
+#endif
 
     return 0;
 }
