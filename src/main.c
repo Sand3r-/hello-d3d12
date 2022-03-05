@@ -26,6 +26,10 @@
 // Number of render targets
 #define FRAMES_NUM 3
 
+#define ID3DBlob_GetBufferPointer(self) ID3D10Blob_GetBufferPointer(self)
+#define ID3DBlob_Release(self) ID3D10Blob_Release(self)
+#define ID3DBlob_GetBufferSize(self) ID3D10Blob_GetBufferSize(self)
+
 #define ExitOnFailure(expression) if (FAILED(expression)) raise(SIGINT);
 #define S(x) #x
 #define S_(x) S(x)
@@ -84,10 +88,10 @@ void EnableDebuggingLayer()
     ExitOnFailure(DXGIGetDebugInterface1(0, &IID_IDXGIDebug1, &g_Debug));
 }
 
-void ReportLiveObjects(const char* report_title)
+void ReportLiveObjects(const char* report)
 {
     OutputDebugString("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
-    OutputDebugString(report_title);
+    OutputDebugString(report);
     OutputDebugString("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
     IDXGIDebug1_ReportLiveObjects(g_Debug, DXGI_DEBUG_ALL, DXGI_DEBUG_RLO_ALL);
 }
@@ -583,6 +587,198 @@ void LoadBuffer(ID3D12Device2* device,
     WaitForFenceValue(g_Fence, fenceValue, g_FenceEvent, 0);
 }
 
+ID3DBlob* LoadShader(LPCWSTR path, LPCSTR target)
+{
+    ID3DBlob* shaderBlob = NULL;
+    ID3DBlob* errorBlob = NULL;
+    UINT flags = D3DCOMPILE_DEBUG | D3DCOMPILE_PARTIAL_PRECISION | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    HRESULT hr = D3DCompileFromFile(path, NULL,
+        D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", target, flags, 0, &shaderBlob, &errorBlob);
+
+    if (FAILED(hr))
+    {
+        char* data = ID3DBlob_GetBufferPointer(errorBlob);
+        OutputDebugString(data);
+        ID3DBlob_Release(errorBlob);
+        exit(HD_EXIT_FAILURE);
+    }
+
+    return shaderBlob;
+}
+
+// From d3dx12.h, converted to C
+//------------------------------------------------------------------------------------------------
+// D3D12 exports a new method for serializing root signatures in the Windows 10 Anniversary Update.
+// To help enable root signature 1.1 features when they are available and not require maintaining
+// two code paths for building root signatures, this helper method reconstructs a 1.0 signature when
+// 1.1 is not supported.
+inline HRESULT D3DX12SerializeVersionedRootSignature(
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* pRootSignatureDesc,
+    D3D_ROOT_SIGNATURE_VERSION MaxVersion,
+    ID3DBlob** ppBlob,
+    ID3DBlob** ppErrorBlob)
+{
+    if (ppErrorBlob != NULL)
+    {
+        *ppErrorBlob = NULL;
+    }
+
+    switch (MaxVersion)
+    {
+        case D3D_ROOT_SIGNATURE_VERSION_1_0:
+            switch (pRootSignatureDesc->Version)
+            {
+                case D3D_ROOT_SIGNATURE_VERSION_1_0:
+                    return D3D12SerializeRootSignature(&pRootSignatureDesc->Desc_1_0, D3D_ROOT_SIGNATURE_VERSION_1, ppBlob, ppErrorBlob);
+
+                case D3D_ROOT_SIGNATURE_VERSION_1_1:
+                {
+                    HRESULT hr = S_OK;
+                    const D3D12_ROOT_SIGNATURE_DESC1* desc_1_1 = &pRootSignatureDesc->Desc_1_1;
+
+                    const SIZE_T ParametersSize = sizeof(D3D12_ROOT_PARAMETER) * desc_1_1->NumParameters;
+                    void* pParameters = (ParametersSize > 0) ? HeapAlloc(GetProcessHeap(), 0, ParametersSize) : NULL;
+                    if (ParametersSize > 0 && pParameters == NULL)
+                    {
+                        hr = E_OUTOFMEMORY;
+                    }
+                    D3D12_ROOT_PARAMETER* pParameters_1_0 = (D3D12_ROOT_PARAMETER*)pParameters;
+
+                    if (SUCCEEDED(hr))
+                    {
+                        for (UINT n = 0; n < desc_1_1->NumParameters; n++)
+                        {
+                            pParameters_1_0[n].ParameterType = desc_1_1->pParameters[n].ParameterType;
+                            pParameters_1_0[n].ShaderVisibility = desc_1_1->pParameters[n].ShaderVisibility;
+
+                            switch (desc_1_1->pParameters[n].ParameterType)
+                            {
+                            case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+                                pParameters_1_0[n].Constants.Num32BitValues = desc_1_1->pParameters[n].Constants.Num32BitValues;
+                                pParameters_1_0[n].Constants.RegisterSpace = desc_1_1->pParameters[n].Constants.RegisterSpace;
+                                pParameters_1_0[n].Constants.ShaderRegister = desc_1_1->pParameters[n].Constants.ShaderRegister;
+                                break;
+
+                            case D3D12_ROOT_PARAMETER_TYPE_CBV:
+                            case D3D12_ROOT_PARAMETER_TYPE_SRV:
+                            case D3D12_ROOT_PARAMETER_TYPE_UAV:
+                                pParameters_1_0[n].Descriptor.RegisterSpace = desc_1_1->pParameters[n].Descriptor.RegisterSpace;
+                                pParameters_1_0[n].Descriptor.ShaderRegister = desc_1_1->pParameters[n].Descriptor.ShaderRegister;
+                                break;
+
+                            case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
+                                const D3D12_ROOT_DESCRIPTOR_TABLE1* table_1_1 = &desc_1_1->pParameters[n].DescriptorTable;
+
+                                const SIZE_T DescriptorRangesSize = sizeof(D3D12_DESCRIPTOR_RANGE) * table_1_1->NumDescriptorRanges;
+                                void* pDescriptorRanges = (DescriptorRangesSize > 0 && SUCCEEDED(hr)) ? HeapAlloc(GetProcessHeap(), 0, DescriptorRangesSize) : NULL;
+                                if (DescriptorRangesSize > 0 && pDescriptorRanges == NULL)
+                                {
+                                    hr = E_OUTOFMEMORY;
+                                }
+                                D3D12_DESCRIPTOR_RANGE* pDescriptorRanges_1_0 = (D3D12_DESCRIPTOR_RANGE*)pDescriptorRanges;
+
+                                if (SUCCEEDED(hr))
+                                {
+                                    for (UINT x = 0; x < table_1_1->NumDescriptorRanges; x++)
+                                    {
+                                        pDescriptorRanges_1_0[x].BaseShaderRegister = table_1_1->pDescriptorRanges[x].BaseShaderRegister;
+                                        pDescriptorRanges_1_0[x].NumDescriptors = table_1_1->pDescriptorRanges[x].NumDescriptors;
+                                        pDescriptorRanges_1_0[x].OffsetInDescriptorsFromTableStart = table_1_1->pDescriptorRanges[x].OffsetInDescriptorsFromTableStart;
+                                        pDescriptorRanges_1_0[x].RangeType = table_1_1->pDescriptorRanges[x].RangeType;
+                                        pDescriptorRanges_1_0[x].RegisterSpace = table_1_1->pDescriptorRanges[x].RegisterSpace;
+                                    }
+                                }
+
+                                D3D12_ROOT_DESCRIPTOR_TABLE* table_1_0 = &pParameters_1_0[n].DescriptorTable;
+                                table_1_0->NumDescriptorRanges = table_1_1->NumDescriptorRanges;
+                                table_1_0->pDescriptorRanges = pDescriptorRanges_1_0;
+                            }
+                        }
+                    }
+
+                    if (SUCCEEDED(hr))
+                    {
+                        D3D12_ROOT_SIGNATURE_DESC desc_1_0;
+                        desc_1_0.NumParameters = desc_1_1->NumParameters;
+                        desc_1_0.pParameters = pParameters_1_0;
+                        desc_1_0.NumStaticSamplers = desc_1_1->NumStaticSamplers;
+                        desc_1_0.pStaticSamplers = desc_1_1->pStaticSamplers;
+                        desc_1_0.Flags = desc_1_1->Flags;
+                        hr = D3D12SerializeRootSignature(&desc_1_0, D3D_ROOT_SIGNATURE_VERSION_1, ppBlob, ppErrorBlob);
+                    }
+
+                    if (pParameters)
+                    {
+                        for (UINT n = 0; n < desc_1_1->NumParameters; n++)
+                        {
+                            if (desc_1_1->pParameters[n].ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+                            {
+                                HeapFree(GetProcessHeap(), 0, (void*)((D3D12_DESCRIPTOR_RANGE*)(pParameters_1_0[n].DescriptorTable.pDescriptorRanges)));
+                            }
+                        }
+                        HeapFree(GetProcessHeap(), 0, pParameters);
+                    }
+                    return hr;
+                }
+            }
+            break;
+
+        case D3D_ROOT_SIGNATURE_VERSION_1_1:
+            return D3D12SerializeVersionedRootSignature(pRootSignatureDesc, ppBlob, ppErrorBlob);
+    }
+
+    return E_INVALIDARG;
+}
+
+ID3D12RootSignature* CreateRootSignature(ID3D12Device2* device)
+{
+    // Create a root signature.
+    D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {0};
+    featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    if (FAILED(ID3D12Device2_CheckFeatureSupport(device, 
+        D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData))))
+    {
+        featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    }
+
+    // Allow input layout and deny unnecessary access to certain pipeline stages.
+    D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags =
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS;
+
+    // A single 32-bit constant root parameter that is used by the vertex shader.
+    // D3D12_ROOT_PARAMETER1
+    D3D12_ROOT_PARAMETER1 rootParameters[1];
+    rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    rootParameters[0].Constants.Num32BitValues = sizeof(mat4) / sizeof(float);
+    rootParameters[0].Constants.ShaderRegister = 0;
+    rootParameters[0].Constants.RegisterSpace = 0;
+
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDescription;
+    rootSignatureDescription.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    rootSignatureDescription.Desc_1_1.NumParameters = _countof(rootParameters);
+    rootSignatureDescription.Desc_1_1.pParameters = rootParameters;
+    rootSignatureDescription.Desc_1_1.NumStaticSamplers = 0;
+    rootSignatureDescription.Desc_1_1.pStaticSamplers = NULL;
+    rootSignatureDescription.Desc_1_1.Flags = rootSignatureFlags;
+
+    // Serialize the root signature.
+    ID3DBlob* rootSignatureBlob;
+    ID3DBlob* errorBlob;
+    ExitOnFailure(D3DX12SerializeVersionedRootSignature(&rootSignatureDescription,
+        featureData.HighestVersion, &rootSignatureBlob, &errorBlob));
+    // Create the root signature.
+    ID3D12RootSignature* rootSignature;
+    ExitOnFailure(ID3D12Device2_CreateRootSignature(device, 0, ID3DBlob_GetBufferPointer(rootSignatureBlob),
+        ID3DBlob_GetBufferSize(rootSignatureBlob), &IID_ID3D12RootSignature, &rootSignature));
+
+    return rootSignature;
+}
+
 void Update()
 {
     static uint64_t frameCounter = 0;
@@ -698,6 +894,7 @@ int main()
     g_CurrentBackBufferIndex = IDXGISwapChain4_GetCurrentBackBufferIndex(swapChain);
 
     g_RTVDescriptorHeap = CreateDescriptorHeap(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, FRAMES_NUM);
+    g_DSVDescriptorHeap = CreateDescriptorHeap(device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1);
     g_RTVDescriptorSize = ID3D12Device2_GetDescriptorHandleIncrementSize(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     UpdateRenderTargetViews(device, swapChain, g_RTVDescriptorHeap);
@@ -742,23 +939,32 @@ int main()
     ID3D12Object_SetName(intermediateIndexBuffer, L"intermediateIndexBuffer");
 
     D3D12_INDEX_BUFFER_VIEW indexBufferView;
+    indexBufferView.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(indexBuffer);
+    indexBufferView.Format = DXGI_FORMAT_R16_UINT;
+    indexBufferView.SizeInBytes = sizeof(g_Indicies);
+
+    // Load the vertex shader.
+    ID3DBlob* vertexShaderBlob = LoadShader(L"shaders/vertex.hlsl", "vs_5_1");
+    // Load the pixel shader.
+    ID3DBlob* pixelShaderBlob = LoadShader(L"shaders/pixel.hlsl", "ps_5_1");
+
     // Depth buffer.
     ID3D12Resource* depthBuffer;
 
     // Root signature
-    ID3D12RootSignature* m_RootSignature;
+    ID3D12RootSignature* rootSignature = CreateRootSignature(device);
 
     // Pipeline state object.
-    ID3D12PipelineState* m_PipelineState;
+    ID3D12PipelineState* pipelineState;
 
-    D3D12_VIEWPORT m_Viewport = { 0.0f, 0.0f, (float)width, (float)height, D3D12_MIN_DEPTH, D3D12_MAX_DEPTH };
-    D3D12_RECT m_ScissorRect = { 0, 0, LONG_MAX, LONG_MAX };
+    D3D12_VIEWPORT viewport = { 0.0f, 0.0f, (float)width, (float)height, D3D12_MIN_DEPTH, D3D12_MAX_DEPTH };
+    D3D12_RECT scissorRect = { 0, 0, LONG_MAX, LONG_MAX };
 
-    float m_FoV = 45.0;
+    float FoV = 45.0;
 
-    mat4 m_ModelMatrix;
-    mat4 m_ViewMatrix;
-    mat4 m_ProjectionMatrix;
+    mat4 ModelMatrix;
+    mat4 ViewMatrix;
+    mat4 ProjectionMatrix;
 
     while (!glfwWindowShouldClose(window))
     {
@@ -775,7 +981,10 @@ int main()
 
     CloseHandle(g_FenceEvent);
 
-    // TODO: release resources, desc heap and root sig, and pipeline state
+    // TODO: release root sig, and pipeline state
+    ID3D12RootSignature_Release(rootSignature);
+    ID3DBlob_Release(vertexShaderBlob);
+    ID3DBlob_Release(pixelShaderBlob);
     ID3D12Resource_Release(indexBuffer);
     ID3D12Resource_Release(intermediateIndexBuffer);
     ID3D12Resource_Release(vertexBuffer);
@@ -786,6 +995,7 @@ int main()
     {
         ID3D12CommandAllocator_Release(g_CommandAllocators[i]);
     }
+    ID3D12DescriptorHeap_Release(g_DSVDescriptorHeap);
     ID3D12DescriptorHeap_Release(g_RTVDescriptorHeap);
     // Please don't ask
     IDXGISwapChain4_Release(swapChain);
