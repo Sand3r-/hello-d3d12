@@ -7,6 +7,7 @@
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <glfw/glfw3.h>
 #include <glfw/glfw3native.h>
+#define CGLM_CONFIG_CLIP_CONTROL CGLM_CLIP_CONTROL_LH_NO
 #include <cglm/cglm.h>
 
 #define COBJMACROS
@@ -40,6 +41,12 @@
 #define GEN_REPORT_STRING() "Reporting Live objects at " __FUNCTION__ ", L:" S__LINE__ "\n"
 #define REPORT_LIVE_OBJ() ReportLiveObjects(GEN_REPORT_STRING())
 
+struct Context
+{
+    mat4 ModelMatrix;
+    mat4 ViewMatrix;
+    mat4 ProjectionMatrix;
+} g_Context;
 
 typedef struct Vertex
 {
@@ -809,8 +816,9 @@ ID3D12PipelineState* CreatePipelineState(ID3D12Device2* device,
         .InputLayout = { inputLayout, _countof(inputLayout) },
         .PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
         .RasterizerState = {
+            .DepthClipEnable = TRUE,
             .FillMode = D3D12_FILL_MODE_SOLID,
-            .CullMode = D3D12_CULL_MODE_BACK
+            .CullMode = D3D12_CULL_MODE_BACK,
         },
         .VS = vertexShaderBytecode,
         .PS = pixelShaderBytecode,
@@ -820,6 +828,12 @@ ID3D12PipelineState* CreatePipelineState(ID3D12Device2* device,
         .SampleDesc = {
             .Count = 1,
             .Quality = 0
+        },
+        .DepthStencilState = {
+            .DepthEnable = TRUE,
+            .DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL,
+            .DepthFunc = D3D12_COMPARISON_FUNC_LESS,
+            .StencilEnable = FALSE
         }
     };
 
@@ -918,17 +932,35 @@ void Update()
         frameCounter = 0;
         elapsedSeconds = 0.0;
     }
+
+    // Update the model matrix.
+    // vec3 angles = {0, 0, 1.0f};
+    // glm_euler(angles, g_Context.ModelMatrix);
+
+    glm_mat4_identity(g_Context.ModelMatrix);
+
+    // Update the view matrix.
+    const vec3 eyePosition = {0, 0, -10};
+    const vec3 focusPoint = {0, 0, 0};
+    const vec3 upDirection = {0, 1, 0};
+    glm_lookat(eyePosition, focusPoint, upDirection, g_Context.ViewMatrix);
 }
 
 void Render(IDXGISwapChain4* swapChain, ID3D12CommandQueue* g_CommandQueue,
-            ID3D12GraphicsCommandList* g_CommandList)
+            ID3D12GraphicsCommandList* commandList, ID3D12PipelineState* pipelineState,
+            ID3D12RootSignature* rootSignature, D3D12_VERTEX_BUFFER_VIEW* vertexBufferView,
+            D3D12_INDEX_BUFFER_VIEW* indexBufferView, D3D12_VIEWPORT* viewport,
+            D3D12_RECT* scisssorRect)
 {
     ID3D12CommandAllocator* commandAllocator = g_CommandAllocators[g_CurrentBackBufferIndex];
     ID3D12Resource* backBuffer = g_BackBuffers[g_CurrentBackBufferIndex];
 
     ID3D12CommandAllocator_Reset(commandAllocator);
-    ID3D12GraphicsCommandList_Reset(g_CommandList, commandAllocator, NULL);
+    ID3D12GraphicsCommandList_Reset(commandList, commandAllocator, NULL);
 
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(g_DSVDescriptorHeap, &dsv);
     // Clear the render target.
     {
         D3D12_RESOURCE_BARRIER barrier = D3D12_RESOURCE_BARRIER_Transition(backBuffer,
@@ -936,16 +968,38 @@ void Render(IDXGISwapChain4* swapChain, ID3D12CommandQueue* g_CommandQueue,
                                                     D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                     D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                                                     D3D12_RESOURCE_BARRIER_FLAG_NONE);
-        ID3D12GraphicsCommandList_ResourceBarrier(g_CommandList, 1, &barrier);
+        ID3D12GraphicsCommandList_ResourceBarrier(commandList, 1, &barrier);
 
         FLOAT clearColor[] = { 0.635f, 0.415f, 0.905f, 1.0f };
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv;
-        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(g_RTVDescriptorHeap, &rtv);
 
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(g_RTVDescriptorHeap, &rtv);
         rtv = D3D12_CPU_DESCRIPTOR_HANDLE_Offset(rtv, g_CurrentBackBufferIndex, g_RTVDescriptorSize);
 
-        ID3D12GraphicsCommandList_ClearRenderTargetView(g_CommandList, rtv, clearColor, 0, NULL);
+        ID3D12GraphicsCommandList_ClearRenderTargetView(commandList, rtv, clearColor, 0, NULL);
+        ID3D12GraphicsCommandList_ClearDepthStencilView(commandList, dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, NULL);
     }
+
+    ID3D12GraphicsCommandList_SetPipelineState(commandList, pipelineState);
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(commandList, rootSignature);
+
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(commandList, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12GraphicsCommandList_IASetVertexBuffers(commandList, 0, 1, vertexBufferView);
+    ID3D12GraphicsCommandList_IASetIndexBuffer(commandList, indexBufferView);
+
+    ID3D12GraphicsCommandList_RSSetViewports(commandList, 1, viewport);
+    ID3D12GraphicsCommandList_RSSetScissorRects(commandList, 1, scisssorRect);
+
+    ID3D12GraphicsCommandList_OMSetRenderTargets(commandList, 1, &rtv, FALSE, &dsv);
+
+    // Update the MVP matrix
+    mat4 mvpMatrix;
+    // glm_mat4_mul(g_Context.ModelMatrix, g_Context.ViewMatrix, mvpMatrix);
+    // glm_mat4_mul(mvpMatrix, g_Context.ProjectionMatrix, mvpMatrix);
+    glm_mat4_mul(g_Context.ProjectionMatrix, g_Context.ViewMatrix, mvpMatrix);
+
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(commandList, 0, sizeof(mat4) / sizeof(float), mvpMatrix, 0);
+
+    ID3D12GraphicsCommandList_DrawIndexedInstanced(commandList, _countof(g_Indicies), 1, 0, 0, 0);
 
     // Present
     {
@@ -954,11 +1008,11 @@ void Render(IDXGISwapChain4* swapChain, ID3D12CommandQueue* g_CommandQueue,
                                                     D3D12_RESOURCE_STATE_PRESENT,
                                                     D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                                                     D3D12_RESOURCE_BARRIER_FLAG_NONE);
-        ID3D12GraphicsCommandList_ResourceBarrier(g_CommandList, 1, &barrier);
+        ID3D12GraphicsCommandList_ResourceBarrier(commandList, 1, &barrier);
 
-        ExitOnFailure(ID3D12GraphicsCommandList_Close(g_CommandList));
+        ExitOnFailure(ID3D12GraphicsCommandList_Close(commandList));
 
-        ID3D12CommandList* const commandLists[] = { (ID3D12CommandList* const)g_CommandList };
+        ID3D12CommandList* const commandLists[] = { (ID3D12CommandList* const)commandList };
         ID3D12CommandQueue_ExecuteCommandLists(g_CommandQueue, _countof(commandLists), commandLists);
 
         g_FrameFenceValues[g_CurrentBackBufferIndex] = Signal(g_CommandQueue, g_Fence, &g_FenceValue);
@@ -980,11 +1034,19 @@ void Flush(ID3D12CommandQueue* commandQueue, ID3D12Fence* fence,
     WaitForFenceValue(fence, fenceValueForSignal, fenceEvent, 0);
 }
 
+void UpdatePerspective(int width, int height, float fov)
+{
+    // Update the projection matrix.
+    float aspectRatio = width / (float)height;
+    glm_perspective(glm_rad(fov), aspectRatio, 0.1f, 100.0f, g_Context.ProjectionMatrix);
+}
+
 typedef struct ResizeData
 {
     D3D12_VIEWPORT* viewport;
     ID3D12Device2* device;
     ID3D12Resource** depthBuffer;
+    float fov;
 } ResizeData;
 
 void Resize(GLFWwindow* window, int width, int height)
@@ -994,6 +1056,7 @@ void Resize(GLFWwindow* window, int width, int height)
     resizeData->viewport->Height = (float)height;
 
     ResizeDepthBuffer(resizeData->device, width, height, resizeData->depthBuffer);
+    UpdatePerspective(width, height, resizeData->fov);
 }
 
 int main()
@@ -1101,17 +1164,15 @@ int main()
     D3D12_RECT scissorRect = { 0, 0, LONG_MAX, LONG_MAX };
 
     resizeData.viewport = &viewport;
+    resizeData.fov = 90.0f;
 
-    float FoV = 45.0;
-
-    mat4 ModelMatrix;
-    mat4 ViewMatrix;
-    mat4 ProjectionMatrix;
-
+    UpdatePerspective(width, height, resizeData.fov);
     while (!glfwWindowShouldClose(window))
     {
         Update();
-        Render(swapChain, g_CommandQueue, g_CommandList);
+        Render(swapChain, g_CommandQueue, g_CommandList, pipelineState,
+               rootSignature, &vertexBufferView, &indexBufferView, &viewport,
+               &scissorRect);
         glfwPollEvents();
     }
 
