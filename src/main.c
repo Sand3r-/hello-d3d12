@@ -30,6 +30,9 @@
 #define ID3DBlob_Release(self) ID3D10Blob_Release(self)
 #define ID3DBlob_GetBufferSize(self) ID3D10Blob_GetBufferSize(self)
 
+#define MAX(x, y) (((x) > (y)) ? (x) : (y))
+#define MIN(x, y) (((x) < (y)) ? (x) : (y))
+
 #define ExitOnFailure(expression) if (FAILED(expression)) raise(SIGINT);
 #define S(x) #x
 #define S_(x) S(x)
@@ -735,7 +738,7 @@ ID3D12RootSignature* CreateRootSignature(ID3D12Device2* device)
     // Create a root signature.
     D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {0};
     featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
-    if (FAILED(ID3D12Device2_CheckFeatureSupport(device, 
+    if (FAILED(ID3D12Device2_CheckFeatureSupport(device,
         D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData))))
     {
         featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
@@ -826,6 +829,73 @@ ID3D12PipelineState* CreatePipelineState(ID3D12Device2* device,
     return pipelineState;
 }
 
+void ResizeDepthBuffer(ID3D12Device2* device, int width, int height, ID3D12Resource** depthBuffer)
+{
+    WaitForFenceValue(g_Fence, g_FenceValue, g_FenceEvent, 0);
+
+    width = MAX(1, width);
+    height = MAX(1, height);
+
+    // Resize screen dependent resources.
+    // Create a depth buffer.
+    D3D12_CLEAR_VALUE optimizedClearValue = {
+        .Color = { 0.0f, 0.0f, 0.0f, 0.0f },
+        .Format = DXGI_FORMAT_D32_FLOAT,
+        .DepthStencil = {
+            .Depth = 1.0f,
+            .Stencil = 0.0f
+        }
+    };
+
+    D3D12_HEAP_PROPERTIES heapProperties = {
+        .Type = D3D12_HEAP_TYPE_DEFAULT,
+        .CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+        .MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN,
+        .CreationNodeMask = 1,
+        .VisibleNodeMask = 1
+    };
+
+    D3D12_RESOURCE_DESC resourceDesc = {
+        .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        .Alignment = 0,
+        .Width = width,
+        .Height = height,
+        .DepthOrArraySize = 1,
+        .MipLevels = 0,
+        .Format = DXGI_FORMAT_D32_FLOAT,
+        .SampleDesc = {
+            .Count = 1,
+            .Quality = 0
+        },
+        .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        .Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+    };
+
+    if (*depthBuffer != NULL) ID3D12Resource_Release(*depthBuffer);
+    ExitOnFailure(ID3D12Device2_CreateCommittedResource(
+        device,
+        &heapProperties,
+        D3D12_HEAP_FLAG_NONE,
+        &resourceDesc,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        &optimizedClearValue,
+        &IID_ID3D12Resource,
+        depthBuffer
+    ));
+
+    // Update the depth-stencil view.
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {
+        .Format = DXGI_FORMAT_D32_FLOAT,
+        .ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D,
+        .Texture2D.MipSlice = 0,
+        .Flags = D3D12_DSV_FLAG_NONE
+    };
+
+    D3D12_CPU_DESCRIPTOR_HANDLE descHandle = {0};
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(g_DSVDescriptorHeap, &descHandle);
+    ID3D12Device2_CreateDepthStencilView(device, *depthBuffer, &dsv, descHandle);
+}
+
 void Update()
 {
     static uint64_t frameCounter = 0;
@@ -910,6 +980,22 @@ void Flush(ID3D12CommandQueue* commandQueue, ID3D12Fence* fence,
     WaitForFenceValue(fence, fenceValueForSignal, fenceEvent, 0);
 }
 
+typedef struct ResizeData
+{
+    D3D12_VIEWPORT* viewport;
+    ID3D12Device2* device;
+    ID3D12Resource** depthBuffer;
+} ResizeData;
+
+void Resize(GLFWwindow* window, int width, int height)
+{
+    ResizeData* resizeData = glfwGetWindowUserPointer(window);
+    resizeData->viewport->Width = (float)width;
+    resizeData->viewport->Height = (float)height;
+
+    ResizeDepthBuffer(resizeData->device, width, height, resizeData->depthBuffer);
+}
+
 int main()
 {
 #ifdef _DEBUG
@@ -931,12 +1017,17 @@ int main()
     }
     glfwSwapInterval(1);
     HWND hWnd = glfwGetWin32Window(window);
+    ResizeData resizeData;
+    glfwSetWindowUserPointer(window, (void*)&resizeData);
+    glfwSetWindowSizeCallback(window, &Resize);
 
     IDXGIAdapter4* dxgiAdapter4 = GetAdapter();
     ID3D12Device2* device = CreateDevice(dxgiAdapter4);
     ID3D12CommandQueue* g_CommandQueue = CreateCommandQueue(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
     IDXGISwapChain4* swapChain = CreateSwapChain(hWnd, g_CommandQueue,
                                                  width, height, FRAMES_NUM);
+
+    resizeData.device = device;
 
     g_CurrentBackBufferIndex = IDXGISwapChain4_GetCurrentBackBufferIndex(swapChain);
 
@@ -995,8 +1086,10 @@ int main()
     // Load the pixel shader.
     ID3DBlob* pixelShaderBlob = LoadShader(L"shaders/pixel.hlsl", "ps_5_1");
 
-    // Depth buffer.
-    ID3D12Resource* depthBuffer;
+    // Create depth buffer
+    ID3D12Resource* depthBuffer = NULL;
+    ResizeDepthBuffer(device, width, height, &depthBuffer);
+    resizeData.depthBuffer = &depthBuffer;
 
     // Root signature
     ID3D12RootSignature* rootSignature = CreateRootSignature(device);
@@ -1006,6 +1099,8 @@ int main()
 
     D3D12_VIEWPORT viewport = { 0.0f, 0.0f, (float)width, (float)height, D3D12_MIN_DEPTH, D3D12_MAX_DEPTH };
     D3D12_RECT scissorRect = { 0, 0, LONG_MAX, LONG_MAX };
+
+    resizeData.viewport = &viewport;
 
     float FoV = 45.0;
 
@@ -1028,7 +1123,7 @@ int main()
 
     CloseHandle(g_FenceEvent);
 
-    // TODO: release root sig, and pipeline state
+    ID3D12Resource_Release(depthBuffer);
     ID3D12PipelineState_Release(pipelineState);
     ID3D12RootSignature_Release(rootSignature);
     ID3DBlob_Release(vertexShaderBlob);
