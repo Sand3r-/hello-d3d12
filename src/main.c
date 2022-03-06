@@ -779,6 +779,53 @@ ID3D12RootSignature* CreateRootSignature(ID3D12Device2* device)
     return rootSignature;
 }
 
+D3D12_SHADER_BYTECODE D3D12_SHADER_BYTECODE_Init(ID3DBlob* blob)
+{
+    D3D12_SHADER_BYTECODE bytecode = {
+        .BytecodeLength = ID3DBlob_GetBufferSize(blob),
+        .pShaderBytecode = ID3DBlob_GetBufferPointer(blob)
+    };
+
+    return bytecode;
+}
+
+ID3D12PipelineState* CreatePipelineState(ID3D12Device2* device,
+    ID3D12RootSignature* rootSignature, ID3DBlob* vertexShaderBlob, ID3DBlob* pixelShaderBlob)
+{
+    // Create the vertex input layout
+    D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "COLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+
+    D3D12_SHADER_BYTECODE vertexShaderBytecode = D3D12_SHADER_BYTECODE_Init(vertexShaderBlob);
+    D3D12_SHADER_BYTECODE pixelShaderBytecode = D3D12_SHADER_BYTECODE_Init(pixelShaderBlob);
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pipelineStateStream = {
+        .pRootSignature = rootSignature,
+        .InputLayout = { inputLayout, _countof(inputLayout) },
+        .PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        .RasterizerState = {
+            .FillMode = D3D12_FILL_MODE_SOLID,
+            .CullMode = D3D12_CULL_MODE_BACK
+        },
+        .VS = vertexShaderBytecode,
+        .PS = pixelShaderBytecode,
+        .DSVFormat = DXGI_FORMAT_D32_FLOAT,
+        .RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM,
+        .NumRenderTargets = 1,
+        .SampleDesc = {
+            .Count = 1,
+            .Quality = 0
+        }
+    };
+
+    ID3D12PipelineState* pipelineState;
+    ID3D12Device2_CreateGraphicsPipelineState(device, &pipelineStateStream, &IID_ID3D12PipelineState, &pipelineState);
+
+    return pipelineState;
+}
+
 void Update()
 {
     static uint64_t frameCounter = 0;
@@ -955,7 +1002,7 @@ int main()
     ID3D12RootSignature* rootSignature = CreateRootSignature(device);
 
     // Pipeline state object.
-    ID3D12PipelineState* pipelineState;
+    ID3D12PipelineState* pipelineState = CreatePipelineState(device, rootSignature, vertexShaderBlob, pixelShaderBlob);
 
     D3D12_VIEWPORT viewport = { 0.0f, 0.0f, (float)width, (float)height, D3D12_MIN_DEPTH, D3D12_MAX_DEPTH };
     D3D12_RECT scissorRect = { 0, 0, LONG_MAX, LONG_MAX };
@@ -982,6 +1029,7 @@ int main()
     CloseHandle(g_FenceEvent);
 
     // TODO: release root sig, and pipeline state
+    ID3D12PipelineState_Release(pipelineState);
     ID3D12RootSignature_Release(rootSignature);
     ID3DBlob_Release(vertexShaderBlob);
     ID3DBlob_Release(pixelShaderBlob);
